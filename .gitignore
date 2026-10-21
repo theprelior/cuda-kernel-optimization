@@ -1,0 +1,7 @@
+matmul/matmul
+reduction/reduce
+histogram/hist
+*.o
+*.nsys-rep
+*.ncu-rep
+.ipynb_checkpoints/
