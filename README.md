@@ -98,7 +98,7 @@ make TILE=32    # rebuild SGEMM with 32x32 tiles
 In Google Colab (Runtime → T4 GPU):
 
 ```bash
-!git clone https://github.com/<user>/cuda-kernel-optimization.git
+!git clone https://github.com/theprelior/cuda-kernel-optimization.git
 %cd cuda-kernel-optimization
 !make run
 ```
