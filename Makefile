@@ -7,7 +7,7 @@ FLAGS  = -O3 -arch=$(ARCH)
 all: matmul/matmul reduction/reduce histogram/hist
 
 matmul/matmul: matmul/matmul.cu common/cuda_check.h
-	$(NVCC) $(FLAGS) -DTILE=$(TILE) $< -o $@
+	$(NVCC) $(FLAGS) -DTILE=$(TILE) $< -o $@ -lcublas
 
 reduction/reduce: reduction/reduce.cu common/cuda_check.h
 	$(NVCC) $(FLAGS) $< -o $@

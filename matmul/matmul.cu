@@ -1,24 +1,36 @@
 // SGEMM: C (m x n) = A (m x k) * B (k x n), row-major, FP32.
 //
-// Two kernels:
+// Two kernels plus a library baseline:
 //   matmul_naive : one thread per C element, all operands read from global memory
 //   matmul_tiled : shared-memory tiling, boundary-safe for arbitrary m, k, n
+//   cuBLAS       : cublasSgemm, the vendor-optimized reference
 //
-// Both are validated against a CPU reference. Inputs are small integers,
+// All are validated against a CPU reference. Inputs are small integers,
 // so every partial sum is exactly representable in FP32 and the comparison
 // can be exact.
 //
-// Build:  nvcc -O3 -arch=sm_75 -DTILE=16 matmul.cu -o matmul
+// Build:  nvcc -O3 -arch=sm_75 -DTILE=16 matmul.cu -o matmul -lcublas
 // Run:    ./matmul
 
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <cublas_v2.h>
 #include "../common/cuda_check.h"
 
 #ifndef TILE
 #define TILE 16
 #endif
+
+#define CUBLAS_CHECK(call)                                                 \
+    do {                                                                   \
+        cublasStatus_t st_ = (call);                                       \
+        if (st_ != CUBLAS_STATUS_SUCCESS) {                                \
+            fprintf(stderr, "cuBLAS error %d\n  at %s:%d\n",               \
+                    (int)st_, __FILE__, __LINE__);                         \
+            exit(EXIT_FAILURE);                                            \
+        }                                                                  \
+    } while (0)
 
 // ---------------------------------------------------------------------------
 // CPU reference
@@ -115,6 +127,46 @@ float time_kernel(MatmulKernel kernel, dim3 grid, dim3 block,
     return ms / reps;
 }
 
+// ---------------------------------------------------------------------------
+// cuBLAS baseline.
+// cuBLAS assumes column-major storage. A row-major matrix read as column-major
+// is its transpose, so C = A*B (row-major) is computed as C^T = B^T * A^T
+// (column-major): pass B first, then A, with dimensions (n, m, k).
+// No data is copied or transposed; only the interpretation changes.
+// ---------------------------------------------------------------------------
+void matmul_cublas(cublasHandle_t handle, const float* dA, const float* dB,
+                   float* dC, int m, int k, int n) {
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             n, m, k,
+                             &alpha,
+                             dB, n,     // B^T : n x k, leading dimension n
+                             dA, k,     // A^T : k x m, leading dimension k
+                             &beta,
+                             dC, n));   // C^T : n x m, leading dimension n
+}
+
+float time_cublas(cublasHandle_t handle, const float* dA, const float* dB,
+                  float* dC, int m, int k, int n, int reps) {
+    matmul_cublas(handle, dA, dB, dC, m, k, n);   // warm-up (also lazy init)
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int r = 0; r < reps; r++)
+        matmul_cublas(handle, dA, dB, dC, m, k, n);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return ms / reps;
+}
+
 int count_mismatches(const float* a, const float* b, int len) {
     int bad = 0;
     for (int i = 0; i < len; i++) if (a[i] != b[i]) bad++;
@@ -162,6 +214,7 @@ void run(int m, int k, int n) {
         {"naive", matmul_naive},
         {"tiled", matmul_tiled},
     };
+    float tiled_ms = 0.0f;
     for (auto& kern : kernels) {
         CUDA_CHECK(cudaMemset(dC, 0, bytesC));
         float ms = time_kernel(kern.fn, grid, block, dA, dB, dC, m, k, n, reps);
@@ -169,8 +222,19 @@ void run(int m, int k, int n) {
         int bad = count_mismatches(hC, hRef, m * n);
         printf("GPU %-6s %s  %8.3f ms  %7.1f GFLOP/s\n", kern.name,
                bad == 0 ? "OK  " : "FAIL", ms, flop / (ms * 1e-3) / 1e9);
+        if (kern.fn == matmul_tiled) tiled_ms = ms;
     }
-    printf("\n");
+
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    CUDA_CHECK(cudaMemset(dC, 0, bytesC));
+    float cublas_ms = time_cublas(handle, dA, dB, dC, m, k, n, reps);
+    CUDA_CHECK(cudaMemcpy(hC, dC, bytesC, cudaMemcpyDeviceToHost));
+    int bad = count_mismatches(hC, hRef, m * n);
+    printf("cuBLAS     %s  %8.3f ms  %7.1f GFLOP/s\n",
+           bad == 0 ? "OK  " : "FAIL", cublas_ms, flop / (cublas_ms * 1e-3) / 1e9);
+    printf("tiled reaches %.0f%% of cuBLAS\n\n", 100.0 * cublas_ms / tiled_ms);
+    CUBLAS_CHECK(cublasDestroy(handle));
 
     CUDA_CHECK(cudaFree(dA));
     CUDA_CHECK(cudaFree(dB));
