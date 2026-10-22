@@ -99,6 +99,66 @@ __global__ void matmul_tiled(const float* A, const float* B, float* C,
 }
 
 // ---------------------------------------------------------------------------
+// 1D register tiling: each thread computes RT = 4 outputs in one column.
+// Block = 32 x 8 threads, computes a 32 x 32 tile of C; k is processed in
+// slices of 8. Per inner step a thread reads 1 value of Bs into a register
+// and 4 values of As, and performs 4 FMAs (5 shared loads / 4 FMA instead of
+// 2 / 1 in the tiled kernel).
+//
+// Each thread wears two hats:
+//   loading   : moves exactly one element of A and one of B into shared memory
+//   computing : accumulates its own 4 outputs in registers
+// ---------------------------------------------------------------------------
+#define RB_M 32   // rows of the C tile
+#define RB_N 32   // columns of the C tile
+#define RB_K 8    // depth of a k slice
+#define RT   4    // outputs per thread
+
+__global__ void matmul_reg(const float* A, const float* B, float* C,
+                           int m, int k, int n) {
+    __shared__ float As[RB_M][RB_K];
+    __shared__ float Bs[RB_K][RB_N];
+
+    int tx = threadIdx.x;               // 0..31
+    int ty = threadIdx.y;               // 0..7
+    int id = ty * RB_N + tx;            // 0..255, linear id used for loading
+
+    // loading hat: which shared-memory slot do I fill?
+    int aTileRow = id / RB_K, aTileCol = id % RB_K;
+    int bTileRow = ty,        bTileCol = tx;
+
+    // computing hat: which C elements are mine?
+    int firstRow = blockIdx.y * RB_M + ty * RT;
+    int col      = blockIdx.x * RB_N + tx;
+
+    float acc[RT] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int t = 0; t < (k + RB_K - 1) / RB_K; t++) {
+        int aRow = blockIdx.y * RB_M + aTileRow;   // tile start + offset
+        int aCol = t * RB_K + aTileCol;
+        As[aTileRow][aTileCol] = (aRow < m && aCol < k) ? A[aRow * k + aCol] : 0.0f;
+
+        int bRow = t * RB_K + bTileRow;
+        int bCol = blockIdx.x * RB_N + bTileCol;
+        Bs[bTileRow][bTileCol] = (bRow < k && bCol < n) ? B[bRow * n + bCol] : 0.0f;
+
+        __syncthreads();
+
+        for (int p = 0; p < RB_K; p++) {
+            float b = Bs[p][tx];                   // one shared load, kept in a register
+            for (int i = 0; i < RT; i++)
+                acc[i] += As[ty * RT + i][p] * b;  // reused RT times
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < RT; i++) {
+        int row = firstRow + i;
+        if (row < m && col < n) C[row * n + col] = acc[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Timing helper: one warm-up launch, then the average of `reps` launches.
 // ---------------------------------------------------------------------------
 typedef void (*MatmulKernel)(const float*, const float*, float*, int, int, int);
@@ -210,19 +270,25 @@ void run(int m, int k, int n) {
     printf("===== m=%d k=%d n=%d  (block %dx%d) =====\n", m, k, n, TILE, TILE);
     printf("CPU (1 thread, naive): %10.3f ms\n", cpu_ms);
 
-    struct { const char* name; MatmulKernel fn; } kernels[] = {
-        {"naive", matmul_naive},
-        {"tiled", matmul_tiled},
+    dim3 block_reg(RB_N, RB_M / RT);              // 32 x 8 threads
+    dim3 grid_reg((n + RB_N - 1) / RB_N, (m + RB_M - 1) / RB_M);
+
+    struct { const char* name; MatmulKernel fn; dim3 g; dim3 b; } kernels[] = {
+        {"naive", matmul_naive, grid,     block},
+        {"tiled", matmul_tiled, grid,     block},
+        {"reg1d", matmul_reg,   grid_reg, block_reg},
     };
     float tiled_ms = 0.0f;
+    float reg_ms = 0.0f;
     for (auto& kern : kernels) {
         CUDA_CHECK(cudaMemset(dC, 0, bytesC));
-        float ms = time_kernel(kern.fn, grid, block, dA, dB, dC, m, k, n, reps);
+        float ms = time_kernel(kern.fn, kern.g, kern.b, dA, dB, dC, m, k, n, reps);
         CUDA_CHECK(cudaMemcpy(hC, dC, bytesC, cudaMemcpyDeviceToHost));
         int bad = count_mismatches(hC, hRef, m * n);
         printf("GPU %-6s %s  %8.3f ms  %7.1f GFLOP/s\n", kern.name,
                bad == 0 ? "OK  " : "FAIL", ms, flop / (ms * 1e-3) / 1e9);
         if (kern.fn == matmul_tiled) tiled_ms = ms;
+        if (kern.fn == matmul_reg)   reg_ms = ms;
     }
 
     cublasHandle_t handle;
@@ -233,7 +299,8 @@ void run(int m, int k, int n) {
     int bad = count_mismatches(hC, hRef, m * n);
     printf("cuBLAS     %s  %8.3f ms  %7.1f GFLOP/s\n",
            bad == 0 ? "OK  " : "FAIL", cublas_ms, flop / (cublas_ms * 1e-3) / 1e9);
-    printf("tiled reaches %.0f%% of cuBLAS\n\n", 100.0 * cublas_ms / tiled_ms);
+    printf("tiled reaches %.0f%% of cuBLAS, reg1d reaches %.0f%%\n\n",
+           100.0 * cublas_ms / tiled_ms, 100.0 * cublas_ms / reg_ms);
     CUBLAS_CHECK(cublasDestroy(handle));
 
     CUDA_CHECK(cudaFree(dA));
